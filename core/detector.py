@@ -15,9 +15,14 @@ class FaceDetector:
             min_detection_confidence=0.5,
             min_tracking_confidence=0.5
         )
+        self.pose = mp.solutions.pose.Pose(
+            min_detection_confidence=0.5,
+            min_tracking_confidence=0.5
+        )
 
     def process(self, frame):
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         face_results = self.face_mesh.process(rgb)
         hand_results = self.hands.process(rgb)
-        return face_results, hand_results
+        pose_results = self.pose.process(rgb)
+        return face_results, hand_results, pose_results

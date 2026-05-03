@@ -10,114 +10,109 @@ try:
 except ImportError:
     _PIL_AVAILABLE = False
 
-def load_gif_as_bgr(path, max_size=200):
-    """Load a GIF (or any image) using Pillow and return as BGR numpy array."""
-    if _PIL_AVAILABLE:
-        try:
-            img = PILImage.open(path).convert('RGB')
-            # Resize so it fits nicely as an overlay
-            img.thumbnail((max_size, max_size), PILImage.LANCZOS)
-            arr = np.array(img)
-            return cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
-        except Exception as e:
-            print(f"[!] Pillow could not load {path}: {e}")
-    # Fallback: try OpenCV directly (works for static frames)
-    img = cv2.imread(path)
-    if img is not None and max(img.shape[:2]) > max_size:
-        scale = max_size / max(img.shape[:2])
-        img = cv2.resize(img, (int(img.shape[1]*scale), int(img.shape[0]*scale)))
+def on_trackbar(val):
+    pass
+
+def crop_black_bars(img, threshold=15):
+    if img is None: return None
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    _, thresh = cv2.threshold(gray, threshold, 255, cv2.THRESH_BINARY)
+    coords = cv2.findNonZero(thresh)
+    if coords is not None:
+        x, y, w, h = cv2.boundingRect(coords)
+        return img[y:y+h, x:x+w]
     return img
 
+def load_and_prep_image(path, max_size=400, crop=False):
+    img = None
+    if _PIL_AVAILABLE and path.lower().endswith('.gif'):
+        try:
+            pil_img = PILImage.open(path).convert('RGB')
+            img = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
+        except Exception as e:
+            print(f"[!] Error loading GIF {path}: {e}")
+    if img is None:
+        img = cv2.imread(path)
+    if img is not None:
+        if crop: img = crop_black_bars(img)
+        h, w = img.shape[:2]
+        if max(h, w) > max_size:
+            scale = max_size / max(h, w)
+            img = cv2.resize(img, (int(w * scale), int(h * scale)))
+    return img
 
-def draw_hud(frame, tracker, monkey_img):
-    """Display 5 monkey photos when pose is matched."""
-    if tracker.monkey_match and monkey_img is not None:
-        h, w = frame.shape[:2]
-        mh, mw = monkey_img.shape[:2]
+def draw_hud(frame, tracker, assets):
+    """Display assets with priority: Monkey > SixSeven > Hamster."""
+    h, w = frame.shape[:2]
+    
+    active_img = None
+    # 1. Monkey (Hand to face) - Top Priority
+    if tracker.monkey_match:
+        active_img = assets.get('monkey')
+    # 2. SixSeven (Arm motion)
+    elif tracker.sixseven_match:
+        active_img = assets.get('sixseven')
+    # 3. Hamster (Frown)
+    elif tracker.hamster_match:
+        active_img = assets.get('hamster')
         
-        # Calculate spacing for 5 monkeys
-        # We'll make them a bit smaller to fit 5 across if needed, 
-        # but for now let's just try to fit them with spacing.
-        num_monkeys = 5
-        padding = 10
-        total_width = (mw * num_monkeys) + (padding * (num_monkeys + 1))
-        
-        # If they don't fit, scale them down
-        display_mw = mw
-        display_mh = mh
-        if total_width > w:
-            scale = (w - (padding * (num_monkeys + 1))) / (mw * num_monkeys)
-            display_mw = int(mw * scale)
-            display_mh = int(mh * scale)
-            monkey_img_scaled = cv2.resize(monkey_img, (display_mw, display_mh))
-        else:
-            monkey_img_scaled = monkey_img
+    if active_img is not None:
+        ah, aw = active_img.shape[:2]
+        x_offset = w - aw - 20
+        y_offset = h - ah - 20
+        if x_offset >= 0 and y_offset >= 0:
+            frame[y_offset:y_offset+ah, x_offset:x_offset+aw] = active_img
             
-        start_x = (w - (display_mw * num_monkeys + padding * (num_monkeys - 1))) // 2
-        y_offset = h - display_mh - 20
-        
-        if y_offset > 0:
-            for i in range(num_monkeys):
-                x_pos = start_x + i * (display_mw + padding)
-                if x_pos + display_mw < w and x_pos >= 0:
-                    frame[y_offset:y_offset+display_mh, x_pos:x_pos+display_mw] = monkey_img_scaled
-
     return frame
 
 def main():
-    parser = argparse.ArgumentParser(description="Monkey Face Detector")
-    parser.add_argument('--camera', type=int, default=0, help="Camera index (usually 0 for built-in, try 1 if it shows your phone)")
+    parser = argparse.ArgumentParser(description="Expression Detector")
+    parser.add_argument('--camera', type=int, default=0, help="Camera index")
     args = parser.parse_args()
 
-    # Load monkey image (GIF requires Pillow; fallback to OpenCV)
-    monkey_img = load_gif_as_bgr('monkey.gif')
-    if monkey_img is None:
-        print("[!] Warning: Could not load monkey.gif — install Pillow: pip install Pillow")
-    else:
-        print(f"[✔] Loaded monkey.gif as {monkey_img.shape[1]}x{monkey_img.shape[0]} overlay")
+    asset_size = 400
+    assets = {
+        'monkey': load_and_prep_image('monkey.gif', max_size=asset_size, crop=True),
+        'hamster': load_and_prep_image('sadhamster.png', max_size=asset_size),
+        'sixseven': load_and_prep_image('sixseven.jpeg', max_size=asset_size)
+    }
 
     print(f"\n[i] Opening camera {args.camera}...")
     cam = CameraStream(src=args.camera)
-    
-    if not cam.cap.isOpened():
-        print(f"\n[!] FATAL: Could not access camera {args.camera}.")
-        print("Tip: If you're on a Mac, try '--camera 1' if index 0 is your iPhone (Continuity Camera).")
-        return
+    if not cam.cap.isOpened(): return
 
     try:
         detector = FaceDetector()
     except Exception as e:
-        print(f"\n[!] FATAL: Failed to initialize MediaPipe: {e}")
-        print("\nPossible fix: Run './venv/bin/python -m pip install --upgrade mediapipe'")
+        print(f"FATAL: {e}")
         return
 
     tracker = ExpressionTracker()
 
-    print("\n[✔] Monkey Matcher started! Match the monkey's pose to see the photo.")
+    # Create window and trackbar for frown sensitivity
+    cv2.namedWindow("Expression Matcher")
+    # Range 0-100, mapped to 0.0-1.0 (default 0.4 -> 40)
+    cv2.createTrackbar("Frown Sens", "Expression Matcher", 40, 100, on_trackbar)
 
     while True:
         frame = cam.read()
-        if frame is None:
-            break
+        if frame is None: break
+
+        # Get sensitivity from slider
+        sens_val = cv2.getTrackbarPos("Frown Sens", "Expression Matcher") / 100.0
+
+        face_results, hand_results, pose_results = detector.process(frame)
+        face_lms = face_results.multi_face_landmarks[0].landmark if face_results.multi_face_landmarks else None
+        hands_lms = hand_results.multi_hand_landmarks if hand_results.multi_hand_landmarks else []
+        pose_lms = pose_results.pose_landmarks if pose_results.pose_landmarks else None
 
         h, w = frame.shape[:2]
-        face_results, hand_results = detector.process(frame)
-
-        face_lms = None
-        if face_results.multi_face_landmarks:
-            face_lms = face_results.multi_face_landmarks[0].landmark
-            
-        hands_lms = []
-        if hand_results.multi_hand_landmarks:
-            hands_lms = hand_results.multi_hand_landmarks
-
-        tracker.update(face_lms, hands_lms, w, h)
-        frame = draw_hud(frame, tracker, monkey_img)
+        # Pass sensitivity to tracker
+        tracker.update(face_lms, hands_lms, pose_lms, w, h, frown_sens=sens_val)
+        frame = draw_hud(frame, tracker, assets)
         
-        cv2.imshow("Monkey Matcher", frame)
-
-        if cv2.waitKey(1) & 0xFF == ord('q'):
-            break
+        cv2.imshow("Expression Matcher", frame)
+        if cv2.waitKey(1) & 0xFF == ord('q'): break
 
     cam.release()
     cv2.destroyAllWindows()

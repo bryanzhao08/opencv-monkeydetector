@@ -1,8 +1,8 @@
 import numpy as np
+from collections import deque
 
 def get_dist(p1, p2):
     return np.linalg.norm(np.array(p1) - np.array(p2))
-
 
 # ── Face helpers ────────────────────────────────────────────────────────────
 
@@ -15,24 +15,31 @@ def get_face_center_and_size(landmarks, w, h):
     face_width = get_dist(l_face, r_face)
     return cx, cy, face_width
 
+def detect_frown(landmarks, w, h, threshold=0.4):
+    """
+    Detects a frown with adjustable threshold.
+    Higher threshold = harder to trigger.
+    """
+    if not landmarks: return False
+    l_corner_y = landmarks[61].y
+    r_corner_y = landmarks[291].y
+    center_y = landmarks[13].y
+    lip_dist = abs(landmarks[13].y - landmarks[14].y)
+    if lip_dist == 0: lip_dist = 0.01
+    
+    # Corners must be below center by (lip_dist * threshold)
+    return (l_corner_y > center_y + lip_dist * threshold) and (r_corner_y > center_y + lip_dist * threshold)
 
 # ── Hand helpers ─────────────────────────────────────────────────────────────
 
 def detect_hand_near_face(hand_landmarks_list, face_cx, face_cy, face_width, w, h):
-    """
-    Returns True if ANY hand's wrist or fingertip is within ~60% of face_width
-    from the face centre — i.e. the hand is raised up to the face/chin area.
-    The monkey in the photo has its hand touching its chin/cheek.
-    """
     if not hand_landmarks_list or face_width == 0:
         return False
 
-    threshold = face_width * 0.85   # generous — the monkey's hand is *on* its face
-
+    threshold = face_width * 1.0 
     for hand in hand_landmarks_list:
         lms = hand.landmark
-        # Check wrist (0), index tip (8), middle tip (12), thumb tip (4)
-        for idx in [0, 4, 8, 12]:
+        for idx in [0, 4, 8, 12, 16, 20]:
             px = lms[idx].x * w
             py = lms[idx].y * h
             dist = get_dist((px, py), (face_cx, face_cy))
@@ -40,31 +47,54 @@ def detect_hand_near_face(hand_landmarks_list, face_cx, face_cy, face_width, w, 
                 return True
     return False
 
-
-# ── Tracker ──────────────────────────────────────────────────────────────────
+# ── Motion Tracker ───────────────────────────────────────────────────────────
 
 class ExpressionTracker:
     def __init__(self):
-        self.hand_near_face = False
         self.monkey_match = False
-        self.match_duration = 0  # frames matched
-
-    def update(self, face_lms, hand_lms, w, h):
+        self.hamster_match = False
+        self.sixseven_match = False
+        self.pose_history = deque(maxlen=15) # Shorter history for faster response
+        
+    def update(self, face_lms, hand_lms, pose_lms, w, h, frown_sens=0.4):
         face_cx, face_cy, face_width = 0.0, 0.0, 0.0
-
         if face_lms:
             face_cx, face_cy, face_width = get_face_center_and_size(face_lms, w, h)
-
-        self.hand_near_face = detect_hand_near_face(
-            hand_lms, face_cx, face_cy, face_width, w, h
-        )
-
-        # Match condition: hand raised to face only
-        if self.hand_near_face:
-            self.monkey_match = True
-            self.match_duration += 1
+            
+        # 1. Monkey: Hand near face
+        self.monkey_match = detect_hand_near_face(hand_lms, face_cx, face_cy, face_width, w, h)
+        
+        # 2. Hamster: Frown
+        self.hamster_match = detect_frown(face_lms, w, h, threshold=frown_sens)
+        
+        # 3. SixSeven: Arm motion
+        self.sixseven_match = False
+        
+        if pose_lms:
+            left_wrist = pose_lms.landmark[15]
+            right_wrist = pose_lms.landmark[16]
+            nose = pose_lms.landmark[0]
+            
+            self.pose_history.append((left_wrist.y, right_wrist.y))
+            
+            if len(self.pose_history) == self.pose_history.maxlen:
+                l_y = [p[0] for p in self.pose_history]
+                r_y = [p[1] for p in self.pose_history]
+                
+                l_range = max(l_y) - min(l_y)
+                r_range = max(r_y) - min(r_y)
+                
+                # Check if hands are away from face
+                l_dist_nose = get_dist((left_wrist.x, left_wrist.y), (nose.x, nose.y))
+                r_dist_nose = get_dist((right_wrist.x, right_wrist.y), (nose.x, nose.y))
+                
+                # Arm swing check:
+                # If hands are moving a lot AND aren't stuck to the face, it's a swing.
+                # We allow monkey_match to be true briefly as arms pass by, 
+                # but sixseven takes precedence if the movement range is very high.
+                if (l_range > 0.2 or r_range > 0.2) and (l_dist_nose > 0.15 and r_dist_nose > 0.15):
+                    self.sixseven_match = True
         else:
-            self.monkey_match = False
-            self.match_duration = 0
+            self.pose_history.clear()
 
-        return self.monkey_match
+        return self.monkey_match or self.hamster_match or self.sixseven_match
